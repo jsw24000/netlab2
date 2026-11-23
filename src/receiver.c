@@ -1,14 +1,150 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "rtp.h"
+#include "rtp_packet.h"
 #include "util.h"
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+static int parse_int(const char *text, long minimum, long maximum, int *value) {
+    char *end = NULL;
+    errno = 0;
+    long parsed = strtol(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' ||
+        parsed < minimum || parsed > maximum) {
+        return -1;
+    }
+    *value = (int)parsed;
+    return 0;
+}
+
+// 握手成功时返回 0，并把 Sender 的第一个 DATA 序号写入 *data_seq。
+static int receiver_handshake(int sockfd, uint32_t *data_seq) {
+    rtp_packet_t request, synack;
+    struct sockaddr_in sender_addr;
+
+    // 首次握手：最多等待 5 秒，只有合法 SYN 才能建立会话。
+    const int64_t first_deadline = rtp_now_ms() + RTP_SYN_WAIT_MS;
+    uint32_t initial_seq = 0;
+    while (1) {
+        const int64_t remaining = first_deadline - rtp_now_ms();
+        if (remaining <= 0) {
+            LOG_DEBUG("Receiver: initial SYN timed out\n");
+            return -1;
+        }
+        const int state = rtp_recv_packet(sockfd, &request, &sender_addr,
+                                          (int)remaining);
+        if (state < 0) {
+            perror("receive SYN");
+            return -1;
+        }
+        if (state == 0) {
+            return -1;
+        }
+        if (request.rtp.flags == RTP_SYN) {
+            initial_seq = request.rtp.seq_num;
+            break;
+        }
+    }
+    *data_seq = rtp_next_seq(initial_seq);
+    LOG_DEBUG("Receiver: got SYN seq=%u\n", initial_seq);
+
+    // 本实验只有一个 Sender；锁定首次合法 SYN 的源地址。
+    // 后续使用 send()/recv() 进行 UDP 通信即可。
+    if (connect(sockfd, (struct sockaddr *)&sender_addr, sizeof(sender_addr)) < 0) {
+        perror("UDP connect to Sender");
+        return -1;
+    }
+    if (!rtp_make_packet(&synack, *data_seq, RTP_SYN | RTP_ACK, NULL, 0)) {
+        return -1;
+    }
+
+    for (int attempt = 1; attempt <= RTP_MAX_RETRIES; ++attempt) {
+        // 第二次握手：发送 SYNACK；100 ms 内没有正确 ACK 就重传。
+        if (rtp_send_packet(sockfd, &synack) != 0) {
+            perror("send SYNACK");
+            return -1;
+        }
+        LOG_DEBUG("Receiver: SYNACK seq=%u, attempt=%d\n", *data_seq, attempt);
+
+        const int64_t deadline = rtp_now_ms() + RTP_RTO_MS;
+        while (1) {
+            const int64_t remaining = deadline - rtp_now_ms();
+            if (remaining <= 0) {
+                break;
+            }
+            const int state = rtp_recv_packet(sockfd, &request, NULL, (int)remaining);
+            if (state < 0) {
+                perror("receive final ACK");
+                return -1;
+            }
+            if (state == 0) {
+                break;
+            }
+            if (request.rtp.flags == RTP_ACK &&
+                request.rtp.seq_num == *data_seq) {
+                // 第三次握手 ACK 不占用新数据序号，首个 DATA 仍从 x+1 开始。
+                LOG_DEBUG("Receiver: final ACK received, seq=%u\n", *data_seq);
+                return 0;
+            }
+            if (request.rtp.flags == RTP_SYN &&
+                request.rtp.seq_num == initial_seq) {
+                // Sender 没有收到上一次 SYNACK 时可能重传原 SYN。
+                if (rtp_send_packet(sockfd, &synack) != 0) {
+                    perror("reply to duplicate SYN");
+                    return -1;
+                }
+            }
+        }
+    }
+    LOG_DEBUG("Receiver: handshake failed after %d SYNACK attempts\n",
+              RTP_MAX_RETRIES);
+    return -1;
+}
 
 int main(int argc, char **argv) {
     if (argc != 5) {
         LOG_FATAL("Usage: ./receiver [listen port] [file path] [window size] "
                   "[mode]\n");
     }
+    int port, window_size, mode;
+    if (parse_int(argv[1], 1, 65535, &port) != 0 ||
+        parse_int(argv[3], 1, 1000000, &window_size) != 0 ||
+        parse_int(argv[4], 0, 1, &mode) != 0) {
+        LOG_FATAL("Receiver: invalid port/window size/mode\n");
+    }
+    (void)argv[2];
+    (void)window_size;
+    (void)mode;
 
-    // your code here
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        LOG_FATAL("Receiver: socket() failed\n");
+    }
+    struct sockaddr_in local_addr = {0};
+    local_addr.sin_family = AF_INET;
+    local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    local_addr.sin_port = htons((uint16_t)port);
+    if (bind(sockfd, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
+        close(sockfd);
+        LOG_FATAL("Receiver: bind() failed; is the port already in use?\n");
+    }
 
-    LOG_DEBUG("Receiver: exiting...\n");
+    uint32_t first_data_seq = 0;
+    if (receiver_handshake(sockfd, &first_data_seq) < 0) {
+        close(sockfd);
+        LOG_FATAL("Receiver: handshake failed or timed out\n");
+    }
+    LOG_MSG("Receiver: RTP three-way handshake completed, expect DATA seq=%u\n",
+            first_data_seq);
+
+    // TODO（下一阶段）：按 GBN/SR 规则接收、确认、缓存并写入文件，最后处理 FIN。
+    close(sockfd);
     return 0;
 }

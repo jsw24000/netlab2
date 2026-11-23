@@ -29,7 +29,8 @@ include_directories(/usr/local/include)
 link_directories(/usr/local/lib)
 include(GoogleTest)
 
-add_library(rtp_all src/util.c)
+# 新增 src/rtp_packet.c，编译为通用报文封装及接收工具。
+add_library(rtp_all src/util.c src/rtp_packet.c)
 
 add_executable(sender src/sender.c)
 target_link_libraries(sender PUBLIC rtp_all)
