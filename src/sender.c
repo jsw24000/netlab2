@@ -276,7 +276,140 @@ static int sender_transfer_gbn(int sockfd, const unsigned char *file_data,
     return 0;
 }
 
-// 只有全部 DATA 得到累积确认后才能发送 FIN。
+
+// 选择重传（SR）发送端：
+// 与 GBN 的差别在于 ACK(seq) 只确认 seq 对应的那一个 DATA。
+// 因而需要为每个已发送的数据包保存一个独立的确认状态。
+static int sender_transfer_sr(int sockfd, const unsigned char *file_data,
+                              size_t file_length, uint32_t first_seq,
+                              size_t window_size) {
+    const size_t packet_count =
+        file_length / PAYLOAD_MAX + (file_length % PAYLOAD_MAX != 0);
+    if (packet_count == 0) {
+        LOG_MSG("Sender: SR transferring empty file (0 DATA packets)\n");
+        return 0;
+    }
+
+    // acked[i]=1 表示「下标 i 对应的 DATA 已经得到单独确认」。
+    // 注意它不意味着窗口左边界必然已经前进。
+    unsigned char *acked = calloc(packet_count, sizeof(*acked));
+    if (acked == NULL) {
+        perror("Sender: calloc SR ACK states");
+        return -1;
+    }
+
+    size_t base = 0;  // 当前窗口中最左边尚未连续确认的数据包下标。
+    size_t next = 0;  // 下一个尚未初次发送的数据包下标。
+    int stall_rounds = 0;
+    int result = -1;
+    int64_t last_progress_ms = rtp_now_ms();
+    rtp_packet_t response;
+    if (last_progress_ms < 0) {
+        goto cleanup;
+    }
+
+    LOG_MSG("Sender: SR transferring %zu bytes in %zu DATA packets, window=%zu\n",
+            file_length, packet_count, window_size);
+
+    while (base < packet_count) {
+        // SR 同样可以流水线发送：只要发送窗口还有空间就继续发送新的 DATA。
+        // 和原 GBN 实现一样，最多突发发送 32 个包后检查 ACK。
+        unsigned int burst = 0;
+        while (next < packet_count && next - base < window_size &&
+               burst < GBN_SEND_BURST) {
+            if (sender_send_data(sockfd, file_data, file_length,
+                                 first_seq, next) != 0) {
+                goto cleanup;
+            }
+            ++next;
+            ++burst;
+        }
+
+        const int64_t now = rtp_now_ms();
+        if (now < 0) {
+            goto cleanup;
+        }
+        const int64_t until_timeout = RTP_RTO_MS - (now - last_progress_ms);
+        if (until_timeout <= 0) {
+            // 官方允许 SR 只使用一个窗口计时器。
+            // 窗口 100ms 内没有向右滑动，则只重发 [base,next) 内未确认的包。
+            if (++stall_rounds > GBN_MAX_STALL_ROUNDS) {
+                LOG_DEBUG("Sender: SR window stalled too long\n");
+                goto cleanup;
+            }
+            size_t retransmissions = 0;
+            for (size_t i = base; i < next; ++i) {
+                if (acked[i]) {
+                    continue; // 关键区别：已确认的包绝不因窗口超时而重复发送。
+                }
+                if (sender_send_data(sockfd, file_data, file_length,
+                                     first_seq, i) != 0) {
+                    goto cleanup;
+                }
+                ++retransmissions;
+                if (retransmissions % GBN_SEND_BURST == 0) {
+                    struct timespec pause_time = {.tv_sec = 0, .tv_nsec = 1000000};
+                    nanosleep(&pause_time, NULL);
+                }
+            }
+            LOG_DEBUG("Sender: SR timeout, retransmitted %zu unacked packets\n",
+                      retransmissions);
+            last_progress_ms = rtp_now_ms();
+            if (last_progress_ms < 0) {
+                goto cleanup;
+            }
+            continue;
+        }
+
+        // 尚有发送空间时至多等 1ms，避免阻塞发送；否则等待 ACK/超时。
+        int wait_ms = (next < packet_count && next - base < window_size)
+                          ? 1 : (int)until_timeout;
+        if (wait_ms < 1) {
+            wait_ms = 1;
+        }
+        const int state = rtp_recv_packet(sockfd, &response, NULL, wait_ms);
+        if (state < 0) {
+            perror("Sender: receive SR ACK");
+            goto cleanup;
+        }
+        if (state != 1 || response.rtp.flags != RTP_ACK) {
+            continue;
+        }
+
+        // SR ACK 的 seq_num = 刚收到的那一包，而不是 GBN 的「下一期望包」。
+        // 用模 2^30 的偏移量定位下标，兼容初始序号接近最大值时的回绕。
+        const size_t index =
+            (size_t)((response.rtp.seq_num - first_seq) & (RTP_SEQ_MOD - 1U));
+        if (index < base || index >= next) {
+            continue;  // 无效、过期或尚未发送的数据包的 ACK。
+        }
+        acked[index] = 1;
+
+        // 接收 ACK(后续包) 只更新该包的状态；仅当 base 起连续得到确认，
+        // 才允许整体右移窗口。例如收到 ACK(3)、ACK(4)，却缺 ACK(2)，
+        // 此时不能越过 2；待 ACK(2) 到来可以一次跨越多个下标。
+        const size_t previous_base = base;
+        while (base < next && acked[base]) {
+            ++base;
+        }
+        if (base != previous_base) {
+            last_progress_ms = rtp_now_ms();
+            stall_rounds = 0;
+            if (last_progress_ms < 0) {
+                goto cleanup;
+            }
+        }
+    }
+
+    LOG_MSG("Sender: all %zu DATA packets individually acknowledged (SR)\n",
+            packet_count);
+    result = 0;
+cleanup:
+    free(acked);
+    return result;
+}
+
+// 只有全部 DATA 得到确认后才能发送 FIN。
 // 本实验 FINACK 的 seq_num 与 FIN 相同，不是 TCP 的 FIN+1 规则。
 static int sender_close_connection(int sockfd, uint32_t fin_seq) {
     rtp_packet_t fin, response;
@@ -327,10 +460,6 @@ int main(int argc, char **argv) {
         parse_int(argv[5], 0, 1, &mode) != 0) {
         LOG_FATAL("Sender: invalid port/window size/mode\n");
     }
-    // 本阶段实现 GBN（mode=0），SR（mode=1）留待下一阶段。
-    if (mode != 0) {
-        LOG_FATAL("Sender: SR (mode=1) is not implemented yet; use mode=0 for GBN\n");
-    }
 
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0) {
@@ -377,13 +506,16 @@ int main(int argc, char **argv) {
         file_length / PAYLOAD_MAX + (file_length % PAYLOAD_MAX != 0);
     const uint32_t fin_seq = data_seq_at(first_data_seq, packet_count);
 
-    const int transfer_ok =
-        sender_transfer_gbn(sockfd, file_data, file_length,
-                            first_data_seq, (size_t)window_size);
+    // mode=0：回退 N，采用累积 ACK；mode=1：选择重传，采用逐包 ACK。
+    const int transfer_ok = (mode == 0)
+        ? sender_transfer_gbn(sockfd, file_data, file_length,
+                              first_data_seq, (size_t)window_size)
+        : sender_transfer_sr(sockfd, file_data, file_length,
+                             first_data_seq, (size_t)window_size);
     free(file_data);
     if (transfer_ok != 0) {
         close(sockfd);
-        LOG_FATAL("Sender: GBN data transfer failed\n");
+        LOG_FATAL("Sender: %s data transfer failed\n", mode == 0 ? "GBN" : "SR");
     }
     if (sender_close_connection(sockfd, fin_seq) != 0) {
         close(sockfd);

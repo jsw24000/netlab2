@@ -238,6 +238,151 @@ static int receiver_transfer_gbn(int sockfd, const char *output_path,
     return -1;
 }
 
+
+// SR 接收窗口中的一个槽位：未收到的数据 ready=0；收到乱序数据后 ready=1。
+// 使用环形数组，而不是每次窗口移动就整体移动 payload，窗口可达 20000。
+typedef struct SrSlot {
+    uint16_t length;
+    unsigned char ready;
+    char payload[PAYLOAD_MAX];
+} sr_slot_t;
+
+// 选择重传的 ACK(seq) 只表示「我已经收到 seq 号 DATA」，不是下一个期望号。
+static int receiver_send_sr_ack(int sockfd, uint32_t received_seq) {
+    rtp_packet_t ack;
+    if (rtp_make_packet(&ack, received_seq, RTP_ACK, NULL, 0) == 0) {
+        return -1;
+    }
+    if (rtp_send_packet(sockfd, &ack) != 0) {
+        perror("Receiver: send SR ACK");
+        return -1;
+    }
+    return 0;
+}
+
+// SR 允许乱序接收和独立 ACK，但文件仍必须按 DATA 序号连续写入。
+static int receiver_transfer_sr(int sockfd, const char *output_path,
+                                uint32_t first_data_seq, size_t window_size) {
+    FILE *output = fopen(output_path, "wb");
+    if (output == NULL) {
+        perror("Receiver: fopen SR output file");
+        return -1;
+    }
+    if (window_size > SIZE_MAX / sizeof(sr_slot_t)) {
+        fclose(output);
+        return -1;
+    }
+    sr_slot_t *slots = calloc(window_size, sizeof(*slots));
+    if (slots == NULL) {
+        perror("Receiver: calloc SR receive window");
+        fclose(output);
+        return -1;
+    }
+
+    uint32_t expected_seq = first_data_seq;  // 最早尚未交付文件的数据包序号。
+    size_t head = 0;                        // 环形缓存中 expected_seq 对应的槽位。
+    size_t received_bytes = 0;
+    size_t accepted_packets = 0;
+    rtp_packet_t packet;
+    int result = -1;
+    int output_open = 1;
+
+    LOG_MSG("Receiver: SR receive window=%zu, starting seq=%u\n",
+            window_size, first_data_seq);
+
+    while (1) {
+        const int state = rtp_recv_packet(sockfd, &packet, NULL, RTP_SYN_WAIT_MS);
+        if (state < 0) {
+            perror("Receiver: receive SR DATA/FIN");
+            break;
+        }
+        if (state == 0) {
+            LOG_DEBUG("Receiver: SR timed out waiting for DATA/FIN\n");
+            break;
+        }
+
+        if (packet.rtp.flags == 0) {
+            // 将 30-bit 序号转换为相对于窗口左边界的距离。
+            // 对于 [expected_seq, expected_seq+W) 内的包：offset < W。
+            const uint32_t offset =
+                (packet.rtp.seq_num - expected_seq) & (RTP_SEQ_MOD - 1U);
+            if ((size_t)offset < window_size) {
+                const size_t pos = (head + (size_t)offset) % window_size;
+                sr_slot_t *slot = &slots[pos];
+                if (!slot->ready) {
+                    // 乱序包也先缓存；同一个 slot 不重复写，防止重复包覆盖数据。
+                    slot->length = packet.rtp.length;
+                    memcpy(slot->payload, packet.payload, slot->length);
+                    slot->ready = 1;
+                }
+
+                // 只要包落在接收窗口内且 CRC/字段合法，就回复它自己的序号。
+                // 即使前面的包尚未到达，也必须发送 ACK，不使用 GBN 的累积 ACK。
+                if (receiver_send_sr_ack(sockfd, packet.rtp.seq_num) != 0) {
+                    break;
+                }
+
+                // 只将从窗口最左端起「连续已收到」的数据交付文件。
+                // 例如缓存 3、4 等待 2；一旦 2 到达，按序写入 2、3、4。
+                while (slots[head].ready) {
+                    sr_slot_t *front = &slots[head];
+                    if (fwrite(front->payload, 1, front->length, output) !=
+                        front->length) {
+                        perror("Receiver: fwrite SR output file");
+                        goto cleanup;
+                    }
+                    received_bytes += front->length;
+                    ++accepted_packets;
+                    front->ready = 0;
+                    expected_seq = rtp_next_seq(expected_seq);
+                    head = (head + 1) % window_size;
+                }
+            } else {
+                // 已被交付的旧 DATA 的 ACK 也可能在网络里丢失。
+                // 对落在当前窗口左侧一个窗口跨度内的重复包，重发独立 ACK；
+                // 对更远的未来包或明显超出窗口的报文，不接收也不确认。
+                const uint32_t behind =
+                    (expected_seq - packet.rtp.seq_num) & (RTP_SEQ_MOD - 1U);
+                if (behind > 0 && (size_t)behind <= window_size) {
+                    if (receiver_send_sr_ack(sockfd, packet.rtp.seq_num) != 0) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
+        if (packet.rtp.flags == RTP_FIN) {
+            // 只有所有 DATA 都已按序交付，FIN 才能被接受。
+            // 提前到达的 FIN 不产生 SR DATA ACK；Sender 会按超时规则重发 FIN。
+            if (packet.rtp.seq_num != expected_seq) {
+                continue;
+            }
+            if (fclose(output) != 0) {
+                perror("Receiver: fclose SR output file");
+                output_open = 0;
+                break;
+            }
+            output_open = 0;
+            LOG_MSG("Receiver: SR wrote %zu bytes in %zu DATA packets\n",
+                    received_bytes, accepted_packets);
+            result = receiver_linger_after_fin(sockfd, expected_seq);
+            if (result == 0) {
+                LOG_MSG("Receiver: RTP transfer completed\n");
+            }
+            break;
+        }
+        // 其他控制报文（例如第三次握手 ACK 的重复包）不改变 SR 数据状态。
+    }
+
+cleanup:
+    if (output_open) {
+        fclose(output);
+    }
+    free(slots);
+    return result;
+}
+
 int main(int argc, char **argv) {
     if (argc != 5) {
         LOG_FATAL("Usage: ./receiver [listen port] [file path] [window size] "
@@ -248,12 +393,6 @@ int main(int argc, char **argv) {
         parse_int(argv[3], 1, 1000000, &window_size) != 0 ||
         parse_int(argv[4], 0, 1, &mode) != 0) {
         LOG_FATAL("Receiver: invalid port/window size/mode\n");
-    }
-    // GBN 在接收端只接受下一个有序包；参数 window_size 仍进行合法性检查，
-    // 发送端使用该参数控制最多有多少个未确认包。
-    (void)window_size;
-    if (mode != 0) {
-        LOG_FATAL("Receiver: SR (mode=1) is not implemented yet; use mode=0 for GBN\n");
     }
 
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -277,10 +416,14 @@ int main(int argc, char **argv) {
     LOG_MSG("Receiver: RTP three-way handshake completed, expect DATA seq=%u\n",
             first_data_seq);
 
-    const int transfer_ok = receiver_transfer_gbn(sockfd, argv[2], first_data_seq);
+    // 根据 mode 选择 GBN 或 SR；复用已验证的三次握手和 FIN 关闭处理。
+    const int transfer_ok = (mode == 0)
+        ? receiver_transfer_gbn(sockfd, argv[2], first_data_seq)
+        : receiver_transfer_sr(sockfd, argv[2], first_data_seq,
+                               (size_t)window_size);
     close(sockfd);
     if (transfer_ok != 0) {
-        LOG_FATAL("Receiver: GBN data transfer failed\n");
+        LOG_FATAL("Receiver: %s data transfer failed\n", mode == 0 ? "GBN" : "SR");
     }
     return 0;
 }

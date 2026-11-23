@@ -185,3 +185,140 @@ bash test/runtest.sh RECEIVER_SINGLE_2
 - `mode=1` 的 SR（选择重传），包括独立 ACK、接收缓存、仅重传未确认包。
 - 官方全部测试与隐藏测试的兼容性/性能检查。
 
+
+# Lab2 第三阶段：SR（Selective Repeat，选择重传）
+
+## 1. 与已有代码的关系
+
+本版本在已经完成且通过 GBN 官方正常测试的代码上增量实现 SR。
+
+- **仅覆盖** `src/sender.c`、`src/receiver.c` 两个文件。
+- 保留原 `src/rtp.h`、`src/rtp_packet.h`、`src/rtp_packet.c`、`src/util.c`、`src/util.h`、`CMakeLists.txt` 和 `src/test.cpp`，它们不需要改动。
+- `mode=0` 仍运行原 GBN 实现；`mode=1` 运行新增 SR 实现。
+- UDP 三次握手、CRC32、FIN/FINACK 关闭逻辑由原实现复用。
+- 本包**没有修改 GitHub 仓库**，需自行复制文件到 CLab 容器并编译。
+
+## 2. SR Sender 的设计
+
+新增 `sender_transfer_sr()`：
+
+- 读取文件和分包仍沿用原先的 `read_all_file()`、`sender_send_data()`，每 DATA 最多 1461 字节。
+- `base` 表示最左侧尚未连续确认的 DATA 下标；`next` 表示下一个尚未初次发送的 DATA 下标。
+- 新增 `acked[i]` 位图。SR 中 `ACK(seq_num)` **只确认 `seq_num` 对应的单个 DATA**，与 GBN 累积 ACK 完全不同。
+- 收到 ACK 时，先用 `(seq_num - first_seq) & (2^30-1)` 计算相对数据包下标；更新 `acked[index]`，只有 `base` 起连续确认时，发送窗口才能滑动。
+- 若窗口在 100 ms 内没有前进，只重传 `[base,next)` 中 `acked[i]==0` 的报文。只维护一个窗口计时器，符合官方 SR 的简化定时要求。
+- `GBN_SEND_BURST=32` 限制每轮新增发送的数据包数，避免窗口很大时一次发送过多 UDP 数据报。
+- 所有数据包独立确认后，复用原代码发送 `FIN(last_data_seq+1)`，等待 `FINACK`。
+
+## 3. SR Receiver 的设计
+
+新增 `receiver_transfer_sr()` 和 `receiver_send_sr_ack()`：
+
+- 使用长度为 `window_size` 的**环形缓存**，每个槽保存 `ready`、`length` 和 `payload`。无需随窗口推进整体复制缓存。
+- `expected_seq` 为下一个可按序交付的数据包序号；`head` 为其对应的环形槽位。
+- 对接收窗口内的合法 DATA，即使乱序，也缓存并发送 `ACK(该 DATA 的 seq_num)`。
+- `expected_seq` 对应的数据到达后，顺序写入该数据包以及后面已经缓存的连续数据，推进接收窗口。
+- 对刚刚交付过、落在窗口左侧一个窗口跨度内的重复 DATA，补发该包的独立 ACK；其他窗口外报文直接丢弃。
+- 只有 `FIN.seq_num == expected_seq` 才接受关闭，之后复用原 `FINACK` 补发逻辑，不再写入其他 DATA。
+
+## 4. 更新代码（在容器项目根目录）
+
+```bash
+cd ~/workspace/code
+
+# 先把 Lab2_SR_选择重传.zip 上传到这个目录
+unzip -o Lab2_SR_选择重传.zip
+
+# 仍保留原有 CMake 文件：src/rtp_packet.c 已在 rtp_all 中
+cmake -S . -B build
+cmake --build build -j
+```
+
+### 手动 SR 端到端测试（mode=1）
+
+终端 A：
+
+```bash
+./build/receiver 45678 /tmp/rtp_sr_out.bin 16 1
+```
+
+终端 B：
+
+```bash
+./build/sender 127.0.0.1 45678 /etc/hosts 16 1
+```
+
+等待双方退出，然后校验：
+
+```bash
+cmp /etc/hosts /tmp/rtp_sr_out.bin && echo 'PASS: SR 文件完全一致'
+```
+
+### 2 MiB 二进制文件测试
+
+```bash
+dd if=/dev/urandom of=/tmp/rtp_sr_input.bin bs=1M count=2 status=none
+```
+
+终端 A：
+
+```bash
+./build/receiver 45679 /tmp/rtp_sr_result.bin 32 1
+```
+
+终端 B：
+
+```bash
+./build/sender 127.0.0.1 45679 /tmp/rtp_sr_input.bin 32 1
+```
+
+校验：
+
+```bash
+cmp /tmp/rtp_sr_input.bin /tmp/rtp_sr_result.bin && echo 'PASS: 2MiB SR'
+```
+
+### 官方自动测试
+
+在项目根目录先确认标准程序可执行（你此前已经修复过这个问题）：
+
+```bash
+chmod +x test/bin/test_sender test/bin/test_receiver
+cmake --build build -j
+```
+
+先跑无错误 SR：
+
+```bash
+./build/rtp_test_all --gtest_filter='RTP.NORMAL_OPT:RTP.NORMAL_OPT_SMALL_WINDOW'
+```
+
+再跑官方公开的 8 个 SR 故障测试：
+
+```bash
+./build/rtp_test_all --gtest_filter='RTP.OPT_SENDER_*:RTP.OPT_RECEIVER_*'
+```
+
+最后回归 GBN：
+
+```bash
+./build/rtp_test_all --gtest_filter='RTP.NORMAL:RTP.NORMAL_SMALL_WINDOW:RTP.SENDER_*:RTP.RECEIVER_*'
+```
+
+也可以运行全部公开测试：
+
+```bash
+./build/rtp_test_all
+```
+
+**注意：** 如果使用 `bash test/runtest.sh NORMAL_OPT`，该脚本的 `.built` 标志可能跳过重新编译；因此建议先手动 `cmake --build build -j`。`test/runtest.sh` 首次运行还会复制 `test/src/test.cpp` 到 `src/test.cpp`，属于官方提供的本地测试流程。当前版本没有修改测试框架。
+
+## 5. 本地验证范围和注意事项
+
+已在独立 Linux 环境编译两端程序，验证空文件、分片边界、2 MiB/10 MiB 文件、窗口 1/16/32/20000、SR 丢失 ACK/数据、损坏、重复、乱序、FINACK 丢失和混合错误，另通过固定初始序号模拟了 2^30 回绕。GBN 正常传输及部分故障恢复回归也已运行。
+
+**这些均为本地独立测试，不是 CLab 容器的官方标准程序互操作测试。** 最终是否通过官方 20 个公开测试点及隐藏测试，需要你在课程环境中运行上述指令确认。故障测试存在随机性，建议对失败点多次运行并保存调试日志。
+
+## 6. AI 使用记录
+
+官方 Lab2 允许 Vibe Coding，但要求提交时附上完整 Session 记录，并以教学网的正式提交说明为准。请保留本次聊天记录及后续修改/调试记录。
