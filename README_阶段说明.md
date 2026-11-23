@@ -54,3 +54,134 @@ cmake --build build -j
 ## 当前实现不自动写入 GitHub
 
 本 ZIP 包是本地实现。将文件复制进容器后，通过 `git diff` 检查，再决定何时提交与推送 GitHub。
+
+# Lab2 第二阶段：无差错文件传输 + Go-Back-N (GBN) + FIN
+
+## 本次修改的文件
+
+- `src/sender.c`：在上一阶段已经成功的三次握手基础上，实现二进制文件读取、按 RTP DATA 分包、GBN 发送窗口与累计 ACK、100 ms 窗口超时重传、FIN/FINACK 关闭。
+- `src/receiver.c`：保留三次握手，实现 GBN 按序接收与文件写入、累计 ACK、乱序/重复包丢弃、FINACK 发送及其丢失后的补发。
+
+**其他文件无需修改。** 继续使用上一阶段已有的 `src/rtp.h`、`src/rtp_packet.h`、`src/rtp_packet.c`、`src/util.[ch]` 和已经包含 `src/rtp_packet.c` 的 `CMakeLists.txt`。
+
+## 什么是“无差错传输”和 GBN 的差异？
+
+无差错文件传输只要求在没有丢包或乱序时，按 `PAYLOAD_MAX=1461` 字节分包发送，接收端依次写入，最后完成关闭。GBN 还需要定义发送窗口、累计 ACK、超时重传和重复包/乱序包处理。这里直接实现完整的 GBN 模式，因此无差错传输也由它涵盖，不另写一套停等协议。
+
+GBN Receiver 不缓存乱序 DATA；例如期待 12 却收到 13，会丢弃 13 并回复 ACK(12)。GBN Sender 收到 ACK(15)，意味着 15 之前所有数据包已经连续确认，而不只是第 15 包。
+
+## 代码说明
+
+### Sender
+
+`sender_transfer_gbn()` 维护两个单调递增的**包下标**：
+
+- `base`：最早尚未累积确认的 DATA 下标。
+- `next`：下一份待发送的 DATA 下标。
+
+始终保证 `next - base <= window_size`。RTP 的实际 `seq_num` 用 `data_seq_at()` 转换，并按 2^30 回绕。`ACK.seq_num` 减去第一个 DATA 的序号后取得累计确认的包数；只有该值落在 `(base, next]` 才能推动窗口。
+
+如果 `base` 在 100 ms 内没有前进，就重传 `[base, next)` 的所有已发送、未确认 DATA。代码每 32 个包分批检查 ACK，重传大窗口时短暂限速，减少 UDP 缓冲区被突发报文挤满的概率。
+
+数据全被确认后发送 `FIN(seq=first_data_seq+packet_count)`；FIN 每 100 ms 重传一次，直到收到相同序号的 FINACK，或达到上限 50 次。
+
+### Receiver
+
+`receiver_transfer_gbn()` 只接受 `seq_num == expected_seq` 的 DATA，并按字节写入文件。每个有效 DATA（包括重复或乱序数据）之后，回复 `ACK(expected_seq)`。对于意外收到的更靠后的 DATA，不缓存、不写入，只重复 ACK 当前期待的序号。
+
+收到符合预期序号的 FIN 后，先关闭文件，再发送 FINACK；再保持 socket 约 2 秒，以便重发被丢失的 FINACK。此阶段不再处理 DATA，防止重复写入。
+
+## 在 CLab 容器中更新代码
+
+将 ZIP 上传到远程容器中的 `~/workspace/code/`，在该目录运行：
+
+```bash
+unzip -o Lab2_GBN_文件传输与关闭.zip
+cmake -S . -B build
+cmake --build build -j
+```
+
+### 测试 A：小文件端到端传输
+
+终端 1：
+
+```bash
+cd ~/workspace/code
+./build/receiver 45678 /tmp/rtp_recv.bin 16 0
+```
+
+终端 2：
+
+```bash
+cd ~/workspace/code
+./build/sender 127.0.0.1 45678 /etc/hosts 16 0
+```
+
+传输结束后任一终端：
+
+```bash
+cmp /etc/hosts /tmp/rtp_recv.bin && echo 'PASS: 两文件完全一致'
+sha256sum /etc/hosts /tmp/rtp_recv.bin
+```
+
+**注意：** 这次 `mode` 必须用 `0`，即 GBN；原来的 `1` 是 SR 模式，本阶段尚未实现。
+
+### 测试 B：2 MiB 随机二进制文件
+
+先创建输入：
+
+```bash
+dd if=/dev/urandom of=/tmp/rtp_input.bin bs=1M count=2 status=none
+```
+
+终端 1：
+
+```bash
+./build/receiver 45679 /tmp/rtp_output.bin 16 0
+```
+
+终端 2：
+
+```bash
+./build/sender 127.0.0.1 45679 /tmp/rtp_input.bin 16 0
+```
+
+检查：
+
+```bash
+cmp /tmp/rtp_input.bin /tmp/rtp_output.bin && echo 'PASS: 2 MiB 二进制文件完全一致'
+```
+
+也可以将两侧窗口同时设置为 `1` 或 `32`，但每次必须使用不同端口或确保上一次进程已经退出。
+
+### 测试 C：课程自带标准 Sender/Receiver
+
+从仓库根目录运行：
+
+```bash
+bash test/runtest.sh NORMAL
+bash test/runtest.sh NORMAL_SMALL_WINDOW
+```
+
+这些测试会分别将自己的 Sender 与标准 Receiver、自己的 Receiver 与标准 Sender 对接。完成后进一步运行（含模拟错误信道）：
+
+```bash
+bash test/runtest.sh SENDER_SINGLE_1
+bash test/runtest.sh RECEIVER_SINGLE_1
+bash test/runtest.sh SENDER_SINGLE_2
+bash test/runtest.sh RECEIVER_SINGLE_2
+```
+
+**关于官方测试脚本：** 第一次运行 `test/runtest.sh` 会复制 `test/src/test.cpp` 到 `src/test.cpp` 并重新构建；随后根目录如果已经有 `.built`，脚本将**跳过自动构建**。以后每次修改代码后先运行 `cmake --build build -j`，或者明确删除 `.built` 后再运行脚本。注意 `src/test.cpp` 可能在本地变成未提交的修改，可通过 `git status` 检查。
+
+`RTP.NORMAL_OPT` 等 SR（mode=1）测试在本阶段预期不能通过，下一阶段再实现 SR。
+
+## 本地验证范围
+
+在独立 Linux 环境下，已成功编译，并通过：空文件、1 字节、1461/1462 字节边界、100 KB、2 MiB、10 MiB、窗口 1/16/32/20000 的端到端比对；2^30 序号回绕；模拟 DATA 丢失、ACK 丢失、数据损坏、重复、乱序及第一次 FINACK 丢失。以上不是 CLab 内官方测试程序的实际评分结果，仍请执行测试 C 核实与标准程序的互操作。
+
+## 仍待完成
+
+- `mode=1` 的 SR（选择重传），包括独立 ACK、接收缓存、仅重传未确认包。
+- 官方全部测试与隐藏测试的兼容性/性能检查。
+
